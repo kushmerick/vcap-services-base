@@ -375,79 +375,101 @@ class VCAP::Services::Base::Provisioner < VCAP::Services::Base::Base
     subscription = nil
     plan = request.plan || "free"
     version = request.version
-
+    preexisting_credentials = prov_handle && prov_handle["credentials"] # just for restore/migrate
     plan_nodes = @nodes.select{ |_, node| node["plan"] == plan}.values
-
-    @logger.debug("[#{service_description}] Picking version nodes from the following #{plan_nodes.count} \'#{plan}\' plan nodes: #{plan_nodes}")
+    @logger.debug("[#{service_description}] Picking version nodes from the following #{nodes.count} \'#{plan}\' plan nodes: #{nodes}")
     if plan_nodes.count > 0
-      allow_over_provisioning = @plan_mgmt[plan.to_sym] && @plan_mgmt[plan.to_sym][:allow_over_provisioning] || false
-
-      version_nodes = plan_nodes.select{ |node|
-        node["supported_versions"] != nil && node["supported_versions"].include?(version)
-      }
+      version_nodes = plan_nodes.select{ |node|  node["supported_versions"] && node["supported_versions"].include?(version) }
       @logger.debug("[#{service_description}] #{version_nodes.count} nodes allow provisioning for version: #{version}")
-
-      if version_nodes.count > 0
-
-        best_node = version_nodes.max_by { |node| node_score(node) }
-
-        if best_node && ( allow_over_provisioning || node_score(best_node) > 0 )
-          best_node = best_node["id"]
-          @logger.debug("[#{service_description}] Provisioning on #{best_node}")
-
-          prov_req = ProvisionRequest.new
-          prov_req.plan = plan
-          prov_req.version = version
-          # use old credentials to provision a service if provided.
-          prov_req.credentials = prov_handle["credentials"] if prov_handle
-
-          @provision_refs[best_node] += 1
-          @nodes[best_node]['available_capacity'] -= @nodes[best_node]['capacity_unit']
-          subscription = nil
-
-          timer = EM.add_timer(@node_timeout) {
-            @provision_refs[best_node] -= 1
-            @node_nats.unsubscribe(subscription)
-            blk.call(timeout_fail)
-          }
-
-          subscription = @node_nats.request("#{service_name}.provision.#{best_node}", prov_req.encode) do |msg|
-            @provision_refs[best_node] -= 1
-            EM.cancel_timer(timer)
-            @node_nats.unsubscribe(subscription)
-            response = ProvisionResponse.decode(msg)
-
-            if response.success
-              @logger.debug("Successfully provision response:[#{response.inspect}]")
-
-              # credentials is not necessary in cache
-              prov_req.credentials = nil
-              credential = response.credentials
-              svc = {:configuration => prov_req.dup, :service_id => credential['name'], :credentials => credential}
-              @logger.debug("Provisioned: #{svc.inspect}")
-              add_instance_handle(svc)
-              blk.call(success(svc))
-            else
-              blk.call(wrap_error(response))
+      allow_over_provisioning = @plan_mgmt[plan.to_sym] && @plan_mgmt[plan.to_sym][:allow_over_provisioning]
+      available_nodes = allow_over_provisioning ? version_nodes : version_nodes.select { |node| node_score(node) > 0 }
+      @logger.debug("[#{service_description}] #{available_nodes.count} nodes have spare capacity")
+      csize = cluster_size(plan)
+      if available_nodes.count >= csize
+        sorted_nodes = available_nodes.sort(&:node_compare)
+        LEADER = sorted_nodes[0]
+        provision_service_on_node(leader, plan, version, preexisting_credentials) { |leader_credentials|
+          credentials = leader_credentials.deep_dup
+          if csize > 1
+            credentials[:cluster] = { :leader => leader, leader => leader_credentials }
+            followers = sorted_nodes[1, csize-1]
+            provision_service_on_followers(followers, plan, version, preexisting_credentials, leader_credentials) do |follower,creds|
+              credentials[:cluster][follower] = creds
             end
           end
-        else
-          # No resources
-          @logger.warn("[#{service_description}] Could not find a node to provision")
-          blk.call(internal_fail)
-        end
+          prov_req = ProvisionRequest.new # FIXME: This seems wierd...
+          prov_req.plan = plan
+          prov_req.version = version
+          svc = {:configuration => prov_req, :service_id => credentials['name'], :credentials => credentials}
+          @logger.debug("Provisioned: #{svc.inspect}")
+          add_instance_handle(svc)
+          blk.call(success(svc))
+        }
       else
-        @logger.error("No available nodes supporting version #{version}")
-        blk.call(failure(ServiceError.new(ServiceError::UNSUPPORTED_VERSION, version)))
+        @logger.warn("Not enough nodes to complete the provision request")
+        blk.call(internal_fail)
       end
     else
-      @logger.error("Unknown plan(#{plan})")
+      @logger.error("Not enough nodes for version #{version}")
+      # FIXME: Distinguish between "no such version" and "no capacity for version"
+      blk.call(failure(ServiceError.new(ServiceError::UNSUPPORTED_VERSION, version)))
+    end
+    if plan_nodes.empty?
+      @logger.error("Unknown plan #{plan}")
+      # FIXME: Distinguish between "no such plan" and "no heartbeats from any of plan's nodes"
       blk.call(failure(ServiceError.new(ServiceError::UNKNOWN_PLAN, plan)))
     end
+  end
   rescue => e
     @logger.warn("Exception at provision_service #{e}")
     blk.call(internal_fail)
   end
+
+  def cluster_size(plan)
+    mgmt = @plan_mgmt[plan.to_sym]
+    mgmt && mgmt[:clustering] && mgmt[:clustering][:cluster_size] ? mgmt[:clustering][:cluster_size] : 1
+  end
+
+  def provision_service_on_followers(followers, plan, version, preexisting_credentials, leader_credentials)
+    followers.each so |node|
+      # TODO: Parallelize
+      provision_service_on_node(node, plan, version, preexisting_credentials, leader_credentials) do |credentials|
+        yield node, credentials
+      end
+    end
+  end
+
+  def  provision_service_on_node(node, plan, version, preexisting_credentials, leader_credentials = nil)
+    prov_req = ProvisionRequest.new
+    prov_req.plan = plan
+    prov_req.version = version
+    prov_req.credentials = preexisting_credentials if preexisting_credentials
+    prov_req.cluster_leader_credentials = leader_credentials if leader_credentials
+    @provision_refs[node] += 1
+    @nodes[node]['available_capacity'] -= @nodes[node]['capacity_unit']
+    subscription = nil
+    timer = EM.add_timer(@node_timeout) {
+      # TODO/FIXME
+      @provision_refs[node] -= 1
+      @node_nats.unsubscribe(subscription)
+      blk.call(timeout_fail)
+    }
+    subscription = @node_nats.request("#{service_name}.provision.#{node}", prov_req.encode) do |msg|
+      @provision_refs[node] -= 1
+      EM.cancel_timer(timer)
+      @node_nats.unsubscribe(subscription)
+      response = ProvisionResponse.decode(msg)
+      if response.success
+        @logger.debug("Successfully provision response:[#{response.inspect}]")
+        yield credentials
+      else
+        # TODO/FIXME
+        @logger.warn
+        raise
+      end
+    end
+  end
+
 
   def bind_instance(instance_id, binding_options, bind_handle=nil, &blk)
     @logger.debug("[#{service_description}] Attempting to bind to service #{instance_id}")

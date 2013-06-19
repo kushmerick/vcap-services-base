@@ -9,6 +9,7 @@ module VCAP::Services::Internal
     required :plan, String
     optional :credentials
     optional :version
+    optional :cluster_leader_credentials
   end
 
   # Node --> Provisioner
